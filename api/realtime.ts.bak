@@ -1,0 +1,66 @@
+// api/realtime.ts
+export const config = { runtime: 'edge' }
+
+export default async function handler(req: Request) {
+  // Must be a WS upgrade
+  if (req.headers.get('upgrade') !== 'websocket') {
+    return new Response('Expected WebSocket', { status: 426 })
+  }
+
+  // Create WS pair
+  // @ts-ignore – Edge runtime provides WebSocketPair
+  const { 0: client, 1: server } = new WebSocketPair()
+  const key = process.env.GOOGLE_API_KEY || (globalThis as any).GOOGLE_API_KEY
+
+  // Accept the client socket
+  server.accept()
+
+  if (!key) {
+    server.send(JSON.stringify({ type: 'error', error: 'Missing GOOGLE_API_KEY' }))
+    server.close()
+    // @ts-ignore
+    return new Response(null, { status: 101, webSocket: client })
+  }
+
+  try {
+    // Connect to Gemini Realtime WS
+    const geminiUrl =
+      `wss://generativelanguage.googleapis.com/v1beta/models/` +
+      `gemini-1.5-flash:streamGenerateContent?key=${key}`
+
+    const gemini = new WebSocket(geminiUrl)
+    gemini.accept && gemini.accept() // no-op on client ws
+
+    gemini.addEventListener('open', () => {
+      // Ask Gemini to speak + emit action JSON alongside speech
+      const sys = {
+        type: 'system',
+        instructions:
+          'You are Mizon, a bilingual (Arabic/English) assistant for a family finance app. ' +
+          'In addition to speaking a short confirmation, emit JSON lines for actions like ' +
+          '{"type":"action","name":"add_notes","payload":{"items":["eggs","bread"]}} or ' +
+          'open_bills, open_bank_deals, open_hospital.'
+      }
+      gemini.send(JSON.stringify(sys))
+    })
+
+    // Forward client -> Gemini (audio chunks or text frames)
+    server.addEventListener('message', (e: MessageEvent) => {
+      if (gemini.readyState === 1) gemini.send(e.data)
+    })
+    server.addEventListener('close', () => gemini.close())
+
+    // Forward Gemini -> client (audio frames or JSON)
+    gemini.addEventListener('message', (e: MessageEvent) => {
+      server.send(e.data)
+    })
+    gemini.addEventListener('close', () => server.close())
+  } catch (err: any) {
+    server.send(JSON.stringify({ type: 'error', error: String(err?.message ?? err) }))
+    server.close()
+  }
+
+  // Complete the upgrade
+  // @ts-ignore
+  return new Response(null, { status: 101, webSocket: client })
+}
